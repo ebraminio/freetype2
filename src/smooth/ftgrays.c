@@ -479,19 +479,28 @@ typedef ptrdiff_t  FT_PtrDist;
   {
     ft_jmp_buf  jump_buffer;
 
-    TCoord  min_ex, max_ex;
+    TCoord  min_ex, max_ex;  /* min and max integer pixel coordinates */
     TCoord  min_ey, max_ey;
+    TCoord  count_ey;        /* same as (max_ey - min_ey) */
 
-    PCell       cell;
-    PCell*      ycells;
-    PCell       cells;
-    FT_PtrDist  max_cells;
-    FT_PtrDist  num_cells;
+    PCell       cell;        /* current cell                            */
+    PCell       cell_free;   /* call allocation next free slot          */
+    PCell       cell_limit;  /* cell allocation limit                   */
 
-    TPos    x,  y;
+    PCell*      ycells;      /* array of cell linked-lists, one per
+                              * vertical coordinate in the current band */
 
-    FT_Outline  outline;
-    TPixmap     target;
+    PCell       cells;       /* cell storage area     */
+    FT_PtrDist  max_cells;   /* cell storage capacity */
+
+    TCell       null_cell;   /* a special cell used to render outside of     */
+                             /* the target bitmap. Also serves as a sentinel */
+                             /* a the end of all linked lists.               */
+
+    TPos        x,  y;       /* last point position */
+
+    FT_Outline  outline;     /* input outline */
+    TPixmap     target;      /* target pixmap */
 
     FT_Raster_Span_Func  render_span;
     void*                render_span_data;
@@ -502,6 +511,8 @@ typedef ptrdiff_t  FT_PtrDist;
 #pragma warning( pop )
 #endif
 
+#define CELL_MAX_X_VALUE    0x7fffffff
+#define CELL_IS_NULL(cell)  ((cell)->x == CELL_MAX_X_VALUE)
 
 #ifndef FT_STATIC_RASTER
 #define ras  (*worker)
@@ -509,9 +520,8 @@ typedef ptrdiff_t  FT_PtrDist;
   static gray_TWorker  ras;
 #endif
 
-#define FT_INTEGRATE( ras, a, b )                                       \
-           if ( ras.cell )                                              \
-             ras.cell->cover += (a), ras.cell->area += (a) * (TArea)(b)
+#define FT_INTEGRATE( ras, a, b )                                     \
+           ras.cell->cover += (a), ras.cell->area += (a) * (TArea)(b)
 
 
   typedef struct gray_TRaster_
@@ -538,7 +548,7 @@ typedef ptrdiff_t  FT_PtrDist;
 
       printf( "%3d:", y );
 
-      for ( ; cell != NULL; cell = cell->next )
+      for ( ; !CELL_IS_NULL(cell); cell = cell->next )
         printf( " (%3d, c:%4d, a:%6d)",
                 cell->x, cell->cover, cell->area );
       printf( "\n" );
@@ -566,11 +576,12 @@ typedef ptrdiff_t  FT_PtrDist;
     /* Note that if a cell is to the left of the clipping region, it is    */
     /* actually set to the (min_ex-1) horizontal position.                 */
 
-    if ( ey >= ras.max_ey || ey < ras.min_ey || ex >= ras.max_ex )
-      ras.cell = NULL;
+    TCoord ey_index = ey - ras.min_ey;
+    if ( ey_index < 0 || ey_index >= ras.count_ey || ex >= ras.max_ex )
+      ras.cell = &ras.null_cell;
     else
     {
-      PCell*  pcell = ras.ycells + ey - ras.min_ey;
+      PCell*  pcell = ras.ycells + ey_index;
       PCell   cell;
 
 
@@ -580,7 +591,7 @@ typedef ptrdiff_t  FT_PtrDist;
       {
         cell = *pcell;
 
-        if ( !cell || cell->x > ex )
+        if ( cell->x > ex )
           break;
 
         if ( cell->x == ex )
@@ -589,11 +600,11 @@ typedef ptrdiff_t  FT_PtrDist;
         pcell = &cell->next;
       }
 
-      if ( ras.num_cells >= ras.max_cells )
+      /* insert new cell */
+      cell = ras.cell_free++;
+      if (cell >= ras.cell_limit)
         ft_longjmp( ras.jump_buffer, 1 );
 
-      /* insert new cell */
-      cell        = ras.cells + ras.num_cells++;
       cell->x     = ex;
       cell->area  = 0;
       cell->cover = 0;
@@ -1218,7 +1229,7 @@ typedef ptrdiff_t  FT_PtrDist;
       unsigned char*  line = ras.target.origin - ras.target.pitch * y;
 
 
-      for ( ; cell != NULL; cell = cell->next )
+      for ( ; !CELL_IS_NULL(cell); cell = cell->next )
       {
         if ( cover != 0 && cell->x > x )
         {
@@ -1266,7 +1277,7 @@ typedef ptrdiff_t  FT_PtrDist;
       TArea   area;
 
 
-      for ( ; cell != NULL; cell = cell->next )
+      for ( ; !CELL_IS_NULL(cell); cell = cell->next )
       {
         if ( cover != 0 && cell->x > x )
         {
@@ -1646,8 +1657,8 @@ typedef ptrdiff_t  FT_PtrDist;
       FT_TRACE7(( "band [%d..%d]: %ld cell%s\n",
                   ras.min_ey,
                   ras.max_ey,
-                  ras.num_cells,
-                  ras.num_cells == 1 ? "" : "s" ));
+                  ras.cell_free - ras.cells.,
+                  ras.cell_free - ras.cells == 1 ? "" : "s" ));
     }
     else
     {
@@ -1690,6 +1701,7 @@ typedef ptrdiff_t  FT_PtrDist;
 
     ras.cells     = buffer + n;
     ras.max_cells = (FT_PtrDist)( FT_MAX_GRAY_POOL - n );
+    ras.cell_limit = ras.cells + ras.max_cells;
     ras.ycells    = (PCell*)buffer;
 
     for ( y = yMin; y < yMax; )
@@ -1705,15 +1717,28 @@ typedef ptrdiff_t  FT_PtrDist;
       do
       {
         TCoord  width = band[0] - band[1];
+        TCoord  w;
         int     error;
 
+        for (w = 0; w < width; ++w)
+          ras.ycells[w] = &ras.null_cell;
 
-        FT_MEM_ZERO( ras.ycells, height * sizeof ( PCell ) );
-
-        ras.num_cells = 0;
-        ras.cell      = NULL;
+        ras.cell_free = ras.cells;
+        ras.cell      = &ras.null_cell;
         ras.min_ey    = band[1];
         ras.max_ey    = band[0];
+        ras.count_ey  = width;
+
+        /* The null cell is used as a sentinal at the end of
+         * all ycells[] linked lists. Its x coordinate should
+         * be maximal to ensure no NULL checks are necessary
+         * when looking for an insertion point in
+         * gray_set_cell(). Other loops should check
+         * the cell pointer with CELL_IS_NULL() to detect
+         * the end of the list.
+         */
+        ras.null_cell.x    = CELL_MAX_X_VALUE;
+        ras.null_cell.next = NULL;;
 
         error     = gray_convert_glyph_inner( RAS_VAR, continued );
         continued = 1;
